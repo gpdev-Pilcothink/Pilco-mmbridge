@@ -80,10 +80,15 @@ def _is_openai_media_block(obj: dict[str, Any]) -> tuple[bool, str | None]:
         return False, ""
     if t == "image_url" and isinstance(obj.get("image_url"), dict):
         return True, "image"
+    if t == "audio_url" and isinstance(obj.get("audio_url"), dict):
+        return True, "audio"
+    if t == "video_url" and isinstance(obj.get("video_url"), dict):
+        return True, "video"
     if t == "input_audio" and isinstance(obj.get("input_audio"), dict):
         return True, "audio"
     if t == "input_video" and isinstance(obj.get("input_video"), dict):
         return True, "video"
+
     # Responses API common naming.
     if t == "input_image":
         return True, "image"
@@ -144,6 +149,14 @@ def _approx_block_bytes(block: Any) -> int:
         # Official OpenAI Chat multimedia fields.
         if block.get("type") == "image_url" and isinstance(block.get("image_url"), dict):
             url = block["image_url"].get("url")
+            if isinstance(url, str):
+                return _size_of_url_or_b64(url)
+        if block.get("type") == "audio_url" and isinstance(block.get("audio_url"), dict):
+            url = block["audio_url"].get("url")
+            if isinstance(url, str):
+                return _size_of_url_or_b64(url)
+        if block.get("type") == "video_url" and isinstance(block.get("video_url"), dict):
+            url = block["video_url"].get("url")
             if isinstance(url, str):
                 return _size_of_url_or_b64(url)
         if block.get("type") == "input_audio" and isinstance(block.get("input_audio"), dict):
@@ -258,8 +271,10 @@ def media_block_for_endpoint(item: MediaItem, endpoint: str) -> Any:
                 },
             }
         return {
-            "type": "input_video",
-            "input_video": {"data": data, "mime_type": mime_type},
+            "type": "video_url",
+            "video_url": {
+                "url": _as_data_uri(data, mime_type)
+            },
         }
 
     if endpoint == "/v1/responses":
@@ -305,18 +320,31 @@ def _string_media_block_for_endpoint(
 
     if endpoint == "/v1/chat/completions":
         if kind == "image":
-            return {"type": "image_url", "image_url": {"url": value}}
+            return {
+                "type": "image_url",
+                "image_url": {"url": value},
+            }
+
+        if kind == "video":
+            return {
+                "type": "video_url",
+                "video_url": {"url": value},
+            }
+
+        # audio
         if data_uri is not None:
             mime_type, data = data_uri
-            details = (
-                {"data": data, "format": _audio_format(mime_type)}
-                if kind == "audio"
-                else {"data": data, "mime_type": mime_type}
-            )
-            return {"type": f"input_{kind}", f"input_{kind}": details}
+            return {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": data,
+                    "format": _audio_format(mime_type),
+                },
+            }
+
         return {
-            "type": f"input_{kind}",
-            f"input_{kind}": {"url": value},
+            "type": "audio_url",
+            "audio_url": {"url": value},
         }
 
     if endpoint == "/v1/responses":
@@ -418,7 +446,7 @@ def replace_or_strip_media_blocks(
                 block_type = node.get("type")
                 if normalized_endpoint == "/v1/responses":
                     return {"type": "input_text", "text": label}
-                if block_type in {"image_url", "input_audio", "input_video"}:
+                if block_type in {"image_url", "audio_url", "video_url", "input_audio", "input_video"}:
                     return {"type": "text", "text": label}
                 if block_type in {"image", "audio", "video"}:
                     return {"type": "text", "text": label}
