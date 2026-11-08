@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Literal
@@ -87,6 +88,7 @@ class Settings:
     max_media_bytes: int = 52_428_800
     max_media_items: int = 8
     http_timeout_seconds: float = 600.0
+    http_keepalive_expiry_seconds: float = 2.0
 
     # Cloudflare/Nginx가 장시간 아무 데이터도 없는 SSE 연결을
     # 종료하지 않도록 보내는 heartbeat 주기.
@@ -96,6 +98,13 @@ class Settings:
     debug_dump: bool = False
     debug_dump_dir: str = ".debug/mm_bridge"
     wrap_upstream_errors: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.http_keepalive_expiry_seconds)
+            or self.http_keepalive_expiry_seconds < 0
+        ):
+            raise ValueError("MM_HTTP_KEEPALIVE_EXPIRY_SECONDS must be finite and >= 0")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -130,6 +139,7 @@ class Settings:
             max_media_bytes=_int("MM_MAX_MEDIA_BYTES", 52_428_800),
             max_media_items=_int("MM_MAX_MEDIA_ITEMS", 8),
             http_timeout_seconds=_float("MM_HTTP_TIMEOUT_SECONDS", 600.0),
+            http_keepalive_expiry_seconds=_float("MM_HTTP_KEEPALIVE_EXPIRY_SECONDS", 2.0),
             stream_heartbeat_seconds=_float("MM_STREAM_HEARTBEAT_SECONDS", 15.0),
             debug_dump=_bool("MM_DEBUG_DUMP", False),
             debug_dump_dir=os.getenv("MM_DEBUG_DUMP_DIR", ".debug/mm_bridge"),

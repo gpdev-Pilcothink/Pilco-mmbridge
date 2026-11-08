@@ -46,7 +46,15 @@ def create_app(settings: Settings) -> FastAPI:
         raise ValueError("MM_BRIDGE_MODE must be 1 or 2")
     app = FastAPI(title="MM Bridge Official Transparent Proxy", version="2.0.0")
     timeout = httpx.Timeout(settings.http_timeout_seconds, connect=min(30.0, settings.http_timeout_seconds))
-    client = httpx.AsyncClient(timeout=timeout, follow_redirects=False)
+    client = httpx.AsyncClient(
+        timeout=timeout,
+        limits=httpx.Limits(
+            max_connections=100,
+            max_keepalive_connections=20,
+            keepalive_expiry=settings.http_keepalive_expiry_seconds,
+        ),
+        follow_redirects=False,
+    )
     cache = None if settings.bridge_mode == 2 else AnalysisCache(settings.analyzer_cache_dir)
 
     app.state.settings = settings

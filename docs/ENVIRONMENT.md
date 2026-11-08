@@ -46,6 +46,7 @@ MM_MAX_BODY_BYTES=104857600
 MM_MAX_MEDIA_BYTES=52428800
 MM_MAX_MEDIA_ITEMS=8
 MM_HTTP_TIMEOUT_SECONDS=600
+MM_HTTP_KEEPALIVE_EXPIRY_SECONDS=2
 MM_STREAM_HEARTBEAT_SECONDS=15
 
 MM_DEBUG_DUMP=false
@@ -62,7 +63,7 @@ MM_WRAP_UPSTREAM_ERRORS=false
 | `MM_BRIDGE_TOKEN` | empty | A long random token | Client authentication token. An empty value disables bridge authentication. |
 | `MM_BRIDGE_MODEL_ID` | `deepseek-v4-mm-bridge` | Any stable client-facing alias | Model ID exposed by the bridge. |
 | `MM_BRIDGE_MODE` | `1` | `1` for a separate analyzer and text model | `1` analyzes current-event media before the final request. `2` skips analyzer enrichment and forwards to a multimodal main model. |
-| `MM_LOG_LEVEL` | `INFO` | `INFO` | Uvicorn log level. Use `DEBUG` only while diagnosing problems. |
+| `MM_LOG_LEVEL` | `INFO` | `INFO` | Uvicorn and bridge log level when started with `main.py`. Bridge logs include UTC timestamps. Use `DEBUG` only while diagnosing problems. |
 
 Generate a token locally:
 
@@ -202,6 +203,7 @@ Allowed values:
 | `MM_MAX_MEDIA_BYTES` | `52428800` | Maximum approximate size of one media item in bytes. |
 | `MM_MAX_MEDIA_ITEMS` | `8` | Maximum number of media items per request. |
 | `MM_HTTP_TIMEOUT_SECONDS` | `600` | Shared HTTP timeout used for analyzer, final-model, and model-discovery upstream requests. A non-stream timeout is returned as a structured HTTP 504 with its stage and elapsed time unless analyzer fail-open is enabled. |
+| `MM_HTTP_KEEPALIVE_EXPIRY_SECONDS` | `2` | Seconds to keep an idle upstream HTTP connection available for reuse. Independent of request/generation timeouts. Must be finite and non-negative; `0` disables idle reuse. |
 | `MM_STREAM_HEARTBEAT_SECONDS` | `15` | SSE heartbeat interval. Set to `0` or less to disable heartbeat messages. |
 
 Remember that base64 media is larger than the original binary file. Reverse-proxy limits must also allow the request size and duration.
@@ -209,6 +211,28 @@ Remember that base64 media is larger than the original binary file. Reverse-prox
 The timeout remains one shared setting. `x-mm-bridge-stage` distinguishes `llama_analyzer`, `vllm_final`, and model-discovery failures; `x-mm-bridge-analyzer-source` distinguishes a fresh analyzer call from a cache hit or fail-open route. With `MM_FAIL_ON_ANALYZER_ERROR=false`, analyzer and analyzer-model-discovery timeouts/transport failures are absorbed into the raw-media `fail_open` route instead of returning 504/502. Best-effort alias-plus-upstream model listing may also absorb model-list failures.
 
 For long-running final-model generations, raise the Bridge timeout as needed and set the client timeout to the same or a larger value. This timeout controls waiting, not generation length; configure the output-token ceiling separately in the calling client.
+
+The bridge retries at most once, after 200 ms, when an upstream connection fails
+with `ConnectError`, or with `RemoteProtocolError: Server disconnected without
+sending a response.` before response headers arrive. This applies to GET/HEAD
+requests and POST requests to `/v1/chat/completions`, `/v1/messages`, and
+`/v1/responses`, including analyzer calls. Other POST endpoints and mutating
+methods are not retried. Existing timeout settings apply to each attempt;
+timeout exceptions, other transport/protocol errors, and HTTP error responses
+are not retried. Reading the response body happens outside the retry loop, for
+both streamed and buffered responses.
+
+A second connection failure follows the existing HTTP 502 handling (or analyzer
+fail-open/model-list fallback policy). Already-started streams are never replayed.
+An empty-response disconnect does not prove that the server did no work; the
+limited generation retry can duplicate upstream computation.
+
+`upstream_connection_retry`, `upstream_connection_recovered`, and
+`upstream_connection_failed` logs identify the request ID, stage, target host/port,
+attempt, connection type when trace data is available, elapsed time, and nested OS
+error codes. They omit URL credentials/query strings, request bodies, and upstream
+error text. `main.py` configures the bridge logger with UTC timestamps; applications
+embedding `create_app()` should configure the `mm_bridge` logger themselves.
 
 ## Debugging
 

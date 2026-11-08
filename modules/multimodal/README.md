@@ -303,6 +303,30 @@ For SSE responses, `upstream.py`:
 
 The heartbeat interval comes from `MM_STREAM_HEARTBEAT_SECONDS`.
 
+## Connection recovery
+
+Both streamed and buffered upstream calls share a header-only send helper. It
+retries once after 200 ms for `ConnectError` or the specific empty-response
+`RemoteProtocolError`, before upstream response headers have arrived. Eligible
+requests are GET/HEAD and POST to `/v1/chat/completions`, `/v1/messages`, or
+`/v1/responses`. The request ID and buffered body are preserved across attempts.
+Timeouts, other protocol errors, HTTP status errors, and failures while reading
+any response body are not retried. A failed connection is discarded by HTTPX;
+the shared client is kept open for concurrent requests.
+
+`MM_HTTP_KEEPALIVE_EXPIRY_SECONDS` defaults to `2` and limits idle connection
+reuse, independently of `MM_HTTP_TIMEOUT_SECONDS`. Recovery/failure logs include
+the target host/port, attempt, connection phase, and available OS error codes.
+The generation retry may duplicate server computation if the original request
+was accepted but its response was lost. Persistent failures retain the existing
+502/fail-open behavior.
+
+Run the connection-recovery regression tests from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Authentication and limits
 
 `security.py` accepts either:

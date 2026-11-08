@@ -8,7 +8,6 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import AsyncIterator
-from urllib.parse import urlencode
 
 import httpx
 from fastapi import Request
@@ -18,6 +17,14 @@ from .config import AuthStyle, Settings
 
 
 logger = logging.getLogger("mm_bridge")
+
+CONNECTION_RETRY_DELAY_SECONDS = 0.2
+EMPTY_RESPONSE_DISCONNECT = "Server disconnected without sending a response."
+RETRYABLE_GENERATION_PATHS = {
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/v1/responses",
+}
 
 
 # SSE 이벤트는 빈 줄로 구분된다.
@@ -149,6 +156,138 @@ def response_headers(headers: dict[str, str]) -> dict[str, str]:
     return out
 
 
+def _retryable_connection_error(exc: httpx.RequestError) -> bool:
+    return isinstance(exc, httpx.ConnectError) or (
+        isinstance(exc, httpx.RemoteProtocolError)
+        and str(exc) == EMPTY_RESPONSE_DISCONNECT
+    )
+
+
+def _connection_error_causes(exc: BaseException) -> str:
+    """Log exception types and OS codes without credentials or response bodies."""
+    pending = [exc]
+    seen: set[int] = set()
+    details: list[str] = []
+    while pending and len(seen) < 16:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        detail = type(current).__name__
+        if isinstance(current, OSError):
+            detail += f"(errno={current.errno},winerror={getattr(current, 'winerror', None)})"
+        details.append(detail)
+        cause = current.__cause__ or current.__context__
+        if cause is not None:
+            pending.append(cause)
+        # ExceptionGroup on Python 3.11+, without requiring it on Python 3.10.
+        pending.extend(getattr(current, "exceptions", ()))
+    return ">".join(details)
+
+
+async def _send_with_connection_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+    *,
+    stage: str,
+    request_id: str,
+) -> httpx.Response:
+    """Return after response headers; never retry response-body consumption."""
+    target = httpx.URL(url)
+    target_port = target.port or (443 if target.scheme == "https" else 80)
+    method = method.upper()
+    can_retry = method in {"GET", "HEAD"} or (
+        method == "POST" and target.path.rstrip("/") in RETRYABLE_GENERATION_PATHS
+    )
+    started = time.perf_counter()
+    for attempt in (1, 2):
+        # A new Request replays the buffered body, not a consumed request stream.
+        request = client.build_request(method, url, headers=headers, content=body)
+        connection = "unknown"
+        phase = "send"
+        headers_received = False
+        transport_causes = ""
+
+        async def trace(name: str, info: dict[str, object]) -> None:
+            nonlocal connection, phase, headers_received, transport_causes
+            if name in {"connection.connect_tcp.started", "connection.connect_unix_socket.started"}:
+                connection = "new"
+                phase = "connect"
+            elif name == "connection.start_tls.started":
+                phase = "tls"
+            elif name.endswith(".send_request_headers.started"):
+                if connection == "unknown":
+                    connection = "reused"
+                phase = "request_headers"
+            elif name.endswith(".send_request_body.started"):
+                phase = "request_body"
+            elif name.endswith(".receive_response_headers.started"):
+                phase = "response_headers"
+            elif name.endswith(".receive_response_headers.complete"):
+                headers_received = True
+            elif name.endswith(".failed"):
+                failure = info.get("exception")
+                if isinstance(failure, BaseException):
+                    # httpcore's pool can re-raise from None, losing the OS cause.
+                    # Capture it at the transport failure before that happens.
+                    causes = _connection_error_causes(failure)
+                    if not transport_causes or "errno=" in causes:
+                        transport_causes = causes
+
+        request.extensions["trace"] = trace
+        try:
+            # stream=True is also required for non-stream client requests: reading
+            # the body must happen outside this retry loop, after headers arrive.
+            response = await client.send(request, stream=True)
+        except httpx.RequestError as exc:
+            retry = (
+                attempt == 1
+                and can_retry
+                and not headers_received
+                and _retryable_connection_error(exc)
+            )
+            logger.warning(
+                "request_id=%s upstream_connection_%s stage=%s target_host=%s "
+                "target_port=%s method=%s attempt=%s connection=%s phase=%s "
+                "elapsed_ms=%s error_type=%s causes=%s retry_delay_ms=%s",
+                request_id,
+                "retry" if retry else "failed",
+                stage,
+                target.host,
+                target_port,
+                method,
+                attempt,
+                connection,
+                phase,
+                int((time.perf_counter() - started) * 1000),
+                type(exc).__name__,
+                transport_causes or _connection_error_causes(exc),
+                int(CONNECTION_RETRY_DELAY_SECONDS * 1000) if retry else 0,
+            )
+            if not retry:
+                raise
+            # HTTPX discards the failed connection. Do not close the shared
+            # client/pool, which may still be serving other concurrent requests.
+            await asyncio.sleep(CONNECTION_RETRY_DELAY_SECONDS)
+        else:
+            if attempt == 2:
+                logger.info(
+                    "request_id=%s upstream_connection_recovered stage=%s "
+                    "target_host=%s target_port=%s attempt=2 connection=%s elapsed_ms=%s",
+                    request_id,
+                    stage,
+                    target.host,
+                    target_port,
+                    connection,
+                    int((time.perf_counter() - started) * 1000),
+                )
+            return response
+    raise AssertionError("connection retry loop exhausted")
+
+
 async def request_bytes(
     client: httpx.AsyncClient,
     method: str,
@@ -168,7 +307,13 @@ async def request_bytes(
         len(body),
     )
     try:
-        resp = await client.request(method, url, headers=headers, content=body)
+        resp = await _send_with_connection_retry(
+            client, method, url, headers, body, stage=stage, request_id=request_id
+        )
+        try:
+            await resp.aread()
+        finally:
+            await resp.aclose()
     except httpx.TimeoutException as exc:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.warning(
@@ -348,35 +493,20 @@ async def stream_upstream(
     upstream_headers["accept-encoding"] = "identity"
 
     logger.info(
-        "request_id=%s stream_connect_start stage=%s url=%s",
+        "request_id=%s stream_connect_start stage=%s",
         request_id,
         stage,
-        url,
     )
 
-    req = client.build_request(
+    resp = await _send_with_connection_retry(
+        client,
         method,
         url,
-        headers=upstream_headers,
-        content=body,
+        upstream_headers,
+        body,
+        stage=stage,
+        request_id=request_id,
     )
-
-    try:
-        resp = await client.send(
-            req,
-            stream=True,
-        )
-    except Exception:
-        logger.exception(
-            "request_id=%s stream_connect_error "
-            "stage=%s elapsed_ms=%s",
-            request_id,
-            stage,
-            int(
-                (time.perf_counter() - started) * 1000
-            ),
-        )
-        raise
 
     content_type = resp.headers.get(
         "content-type",
