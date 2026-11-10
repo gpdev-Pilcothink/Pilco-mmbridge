@@ -234,6 +234,17 @@ error codes. They omit URL credentials/query strings, request bodies, and upstre
 error text. `main.py` configures the bridge logger with UTC timestamps; applications
 embedding `create_app()` should configure the `mm_bridge` logger themselves.
 
+Client cancellation needs no extra environment setting. If the client connection
+closes before the response completes, the bridge cancels that request's model
+discovery, analysis, or final-model call and closes its response resources. This
+applies to streaming and non-streaming requests, including the wait for upstream
+response headers. It does not close the shared HTTP client or retry the cancelled
+request. `client_disconnected` logs show the request ID, stage, response-started
+flag, received bytes, and elapsed time. A proxy that keeps its origin connection
+open can delay detection; whether upstream GPU work stops depends on the model
+server's own cancellation support. Existing timeout and heartbeat values are
+unchanged.
+
 ## Debugging
 
 | Variable | Code default | Production recommendation | Description |

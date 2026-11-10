@@ -17,6 +17,7 @@ from .analysis_contract import AnalysisResult, process_analysis_text
 from .cache import AnalysisCache, make_cache_key
 from .config import Settings
 from .context import extract_current_request_context
+from .lifecycle import ClientDisconnectMiddleware
 from .media import MediaItem, replace_or_strip_media_blocks
 from .prompting import (
     analyzer_truncation_reason,
@@ -45,6 +46,7 @@ def create_app(settings: Settings) -> FastAPI:
     if settings.bridge_mode not in {1, 2}:
         raise ValueError("MM_BRIDGE_MODE must be 1 or 2")
     app = FastAPI(title="MM Bridge Official Transparent Proxy", version="2.0.0")
+    app.add_middleware(ClientDisconnectMiddleware)
     timeout = httpx.Timeout(settings.http_timeout_seconds, connect=min(30.0, settings.http_timeout_seconds))
     client = httpx.AsyncClient(
         timeout=timeout,
@@ -130,6 +132,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def models(request: Request) -> Response:
         check_client_auth(request, settings)
         request_id = _request_id(request)
+        assert_body_size(await request.body(), settings)
         if settings.models_policy == "passthrough":
             return await _forward_raw(request, settings, client, request_id, stage="vllm_models")
         return await _models_response(request, settings, client, request_id)
@@ -756,15 +759,21 @@ async def _llama_model(
 
 
 def _request_id(request: Request) -> str:
+    cached = getattr(request.state, "mm_bridge_request_id", None)
+    if isinstance(cached, str) and SAFE_REQUEST_ID_RE.fullmatch(cached):
+        return cached
     supplied = (
         request.headers.get("x-request-id")
         or request.headers.get("x-mm-bridge-request-id")
     )
     if supplied and SAFE_REQUEST_ID_RE.fullmatch(supplied):
-        return supplied
-    if supplied:
-        logger.warning("rejected unsafe client request id")
-    return uuid.uuid4().hex[:16]
+        request_id = supplied
+    else:
+        if supplied:
+            logger.warning("rejected unsafe client request id")
+        request_id = uuid.uuid4().hex[:16]
+    request.state.mm_bridge_request_id = request_id
+    return request_id
 
 
 def _json_bytes(value: Any) -> bytes:

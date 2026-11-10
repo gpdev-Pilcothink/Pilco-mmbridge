@@ -7,13 +7,15 @@ import re
 import time
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import AsyncGenerator, AsyncIterator
 
+import anyio
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .config import AuthStyle, Settings
+from .lifecycle import close_resource, set_request_stage, track_resource
 
 
 logger = logging.getLogger("mm_bridge")
@@ -196,6 +198,7 @@ async def _send_with_connection_retry(
     request_id: str,
 ) -> httpx.Response:
     """Return after response headers; never retry response-body consumption."""
+    set_request_stage(stage)
     target = httpx.URL(url)
     target_port = target.port or (443 if target.scheme == "https" else 80)
     method = method.upper()
@@ -273,6 +276,7 @@ async def _send_with_connection_retry(
             # client/pool, which may still be serving other concurrent requests.
             await asyncio.sleep(CONNECTION_RETRY_DELAY_SECONDS)
         else:
+            track_resource(response)
             if attempt == 2:
                 logger.info(
                     "request_id=%s upstream_connection_recovered stage=%s "
@@ -313,7 +317,7 @@ async def request_bytes(
         try:
             await resp.aread()
         finally:
-            await resp.aclose()
+            await close_resource(resp)
     except httpx.TimeoutException as exc:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.warning(
@@ -395,7 +399,7 @@ def make_response(result: UpstreamResult, stage: str, request_id: str, settings:
 async def iter_sse_with_heartbeat(
     source: AsyncIterator[bytes],
     heartbeat_seconds: float,
-) -> AsyncIterator[bytes]:
+) -> AsyncGenerator[bytes, None]:
     """SSE 이벤트 경계를 보존하면서 idle 구간에 heartbeat를 전송한다.
 
     upstream chunk가 SSE 이벤트 중간에서 잘릴 수 있으므로,
@@ -467,11 +471,12 @@ async def iter_sse_with_heartbeat(
             yield bytes(buffer)
 
     finally:
-        if pending is not None and not pending.done():
-            pending.cancel()
-
-            with suppress(asyncio.CancelledError):
-                await pending
+        if pending is not None:
+            if not pending.done():
+                pending.cancel()
+            with anyio.CancelScope(shield=True):
+                with suppress(asyncio.CancelledError, Exception):
+                    await pending
 
 async def stream_upstream(
     client: httpx.AsyncClient,
@@ -544,7 +549,7 @@ async def stream_upstream(
         content_encoding or "identity",
     )
 
-    async def iterator() -> AsyncIterator[bytes]:
+    async def iterator() -> AsyncGenerator[bytes, None]:
         heartbeat_count = 0
         first_payload_seen = False
 
@@ -629,7 +634,15 @@ async def stream_upstream(
             raise
 
         finally:
-            await resp.aclose()
+            with anyio.CancelScope(shield=True):
+                try:
+                    # Closing an outer async generator does not automatically
+                    # close the inner heartbeat generator and its pending read.
+                    close_stream = getattr(stream, "aclose", None)
+                    if close_stream is not None:
+                        await close_stream()
+                finally:
+                    await close_resource(resp)
 
             logger.info(
                 "request_id=%s stream_closed "
@@ -671,8 +684,10 @@ async def stream_upstream(
 
     # Content-Type은 upstream response header에 이미 있으므로
     # media_type을 다시 지정하지 않는다.
+    body_iterator = iterator()
+    track_resource(body_iterator)
     return StreamingResponse(
-        iterator(),
+        body_iterator,
         status_code=resp.status_code,
         headers=out_headers,
     )

@@ -58,6 +58,7 @@ The bridge preserves the incoming API protocol and endpoint. It does not transla
 - OpenAI- and Anthropic-compatible request handling
 - Optional media replacement for text-only final models
 - SSE streaming with optional heartbeat messages
+- Client-disconnect cleanup for both streaming and non-streaming requests
 - Automatic model discovery through `/v1/models`
 
 ## Multimodal evidence blocks
@@ -269,6 +270,7 @@ curl http://127.0.0.1:18000/v1/chat/completions \
       ├─ cache.py
       ├─ config.py
       ├─ context.py
+      ├─ lifecycle.py
       ├─ media.py
       ├─ prompting.py
       ├─ security.py

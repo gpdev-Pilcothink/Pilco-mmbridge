@@ -10,6 +10,7 @@ This package contains the complete MM-Bridge request pipeline: configuration loa
 | `analysis_contract.py` | Parses, normalizes, repairs, and validates analyzer evidence against incoming attachment metadata. |
 | `config.py` | Reads environment variables into the immutable `Settings` dataclass and defines supported policy types. |
 | `context.py` | Separates the active real-user request from the current direct-user or tool-result event so historical media is not reanalyzed. |
+| `lifecycle.py` | Watches client disconnects and cleans up only that request's upstream calls and response streams. |
 | `media.py` | Finds image, audio, and video blocks; estimates media size; computes hashes; and keeps, replaces, or removes media in the final request. |
 | `prompting.py` | Extracts the exact user request, builds analyzer requests, defines OCR-safe prompts, injects analysis into the original protocol, rewrites model IDs, and extracts analyzer text. |
 | `cache.py` | Stores analyzer responses in a file cache keyed by prompt version, endpoint, analyzer model, media hashes, and the exact user request. |
@@ -321,11 +322,32 @@ The generation retry may duplicate server computation if the original request
 was accepted but its response was lost. Persistent failures retain the existing
 502/fail-open behavior.
 
-Run the connection-recovery regression tests from the repository root:
+## Client cancellation
 
-```bash
-python -m unittest discover -s tests -v
-```
+The bridge watches the HTTP connection after the incoming request body has been
+read. When a client disconnects before the response finishes, it cancels that
+request's processing and closes its upstream responses. This covers model
+discovery, analyzer calls, waiting for final-model response headers, buffered
+responses, and streaming responses. It also stops a pending connection retry.
+Other requests and the shared HTTP client stay open.
+
+This uses the standard ASGI `http.disconnect` event (or a failed response send),
+so it does not depend on a particular harness or an OpenAI/Anthropic payload
+field. Incoming body reads and the stream's disconnect listener share one
+serialized receive path. Upload interruptions are logged as client disconnects
+instead of unhandled `ClientDisconnect` errors. A normal response completion is
+not treated as an abandoned request.
+
+An INFO log records `client_disconnected` with the request ID, processing stage,
+whether the response started, received byte count, and elapsed time. It does not
+record the prompt, media, or authentication headers.
+
+The client or any intermediary proxy must actually close the bridge-facing
+request for this to be detected. Merely displaying an error while leaving that
+connection open does not notify the bridge. Closing the upstream HTTP request
+also does not prove that an upstream inference engine stopped computation; that
+depends on its disconnect/cancellation handling and must be verified there.
+This change does not extend timeouts or make slow model generations finish sooner.
 
 ## Authentication and limits
 
